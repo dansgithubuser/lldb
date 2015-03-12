@@ -13,9 +13,15 @@
 
 // C Includes
 // C++ Includes
+#include <chrono>
+#include <fstream>
+#include <map>
+#include <set>
+#include <sstream>
 // Other libraries and framework includes
 // Project includes
 #include "lldb/lldb-private.h"
+#include "lldb/Core/Module.h"
 #include "lldb/Core/State.h"
 #include "lldb/Core/SourceManager.h"
 #include "lldb/Core/ValueObject.h"
@@ -2210,6 +2216,397 @@ public:
 };
 
 //-------------------------------------------------------------------------
+// CommandObjectThreadTag
+//-------------------------------------------------------------------------
+
+class CommandObjectThreadTag : public CommandObjectParsed
+{
+public:
+    CommandObjectThreadTag (CommandInterpreter &interpreter) :
+        CommandObjectParsed (interpreter,
+                             "thread tag",
+                             "Tag the set of instructions currently being executed.",
+                             "to clear tags: thread tag, to tag: thread tag <config file>",
+                             eFlagRequiresProcess       |
+                             eFlagRequiresThread        |
+                             eFlagTryTargetAPILock      |
+                             eFlagProcessMustBeLaunched |
+                             eFlagProcessMustBePaused)
+    {
+        CommandArgumentEntry arg;
+        CommandArgumentData data;
+
+        data.arg_type = eArgTypeValue;
+        arg.push_back(data);
+
+        m_arguments.push_back(arg);
+
+        clear();
+    }
+
+    virtual ~CommandObjectThreadTag() {}
+
+protected:
+    void
+    clear()
+    {
+        m_thread_to_path.clear();
+        m_step = 0;
+        m_thread_to_step.clear();
+        m_start = std::chrono::steady_clock::now();
+    }
+
+    virtual bool
+    DoExecute(Args &command, CommandReturnObject &result)
+    {
+        // Checks.
+        Process *process = m_exe_ctx.GetProcessPtr();
+        if (process == NULL)
+        {
+            result.AppendError("no process");
+            result.SetStatus(eReturnStatusFailed);
+            return false;
+        }
+        else if (command.GetArgumentCount() > 1)
+        {
+            result.AppendErrorWithFormat("'%s' usage: %s\n", m_cmd_name.c_str(), m_cmd_syntax.c_str());
+            result.SetStatus(eReturnStatusFailed);
+            return false;
+        }
+        else if (command.GetArgumentCount() == 0)
+        {
+            clear();
+            result.SetStatus(eReturnStatusSuccessFinishNoResult);
+            return true;
+        }
+
+        // Config.
+        uint32_t timeout;
+        std::string outputFileName;
+        std::string file;
+        std::set<Point> stepIn;
+        std::ifstream configFile(command.GetArgumentAtIndex(0));
+        std::string s;
+        while (configFile >> s)
+        {
+            if (s == "timeout")
+                configFile >> timeout;
+            else if (s == "output")
+                configFile >> outputFileName;
+            else if (s == "file")
+            {
+                std::getline(configFile, file);
+                file.erase(0, 1);
+            }
+            else if (s == "step_in")
+            {
+                addr_t a;
+                configFile >> std::hex >> a;
+                stepIn.insert(Point(file, a));
+            }
+            else if (s == "#")
+            {
+                std::getline(configFile, file);
+            }
+            else
+            {
+                result.AppendErrorWithFormat("unknown config directive %s\n", s.c_str());
+                result.SetStatus(eReturnStatusFailed);
+                return false;
+            }
+        }
+
+        // Perform.
+        std::ofstream logFile(outputFileName.c_str());
+        logFile << "log=[]\n";
+        Time start = std::chrono::steady_clock::now();
+        m_step = 0;
+        ThreadList &threadList = process->GetThreadList();
+        uint32_t threadIndex = 0;
+        while (std::chrono::steady_clock::now() < start + std::chrono::seconds(timeout))
+        {
+            // Select a thread to step.
+            if (threadIndex >= threadList.GetSize())
+                threadIndex = 0;
+            ThreadSP thread = threadList.GetThreadAtIndex(threadIndex);
+            ++threadIndex;
+
+            // Step.
+            ++m_step;
+            ThreadPlanSP new_plan_sp;
+            bool over = true;
+            if (stepIn.count(Point(thread->GetStackFrameAtIndex(0))))
+                over = false;
+            new_plan_sp = thread->QueueThreadPlanForStepSingleInstruction(over, false, true);
+
+            // If we got a new plan, then set it to be a master plan (User level Plans should be master plans
+            // so that they can be interruptible).  Then resume the process.
+
+            if (new_plan_sp)
+            {
+                new_plan_sp->SetIsMasterPlan(true);
+                new_plan_sp->SetOkayToDiscard(false);
+
+                process->GetThreadList().SetSelectedThreadByID(thread->GetID());
+
+                Error error;
+                error = process->ResumeSynchronous(NULL);
+
+                // There is a race condition where this thread will return up the call stack to the main command handler
+                // and show an (lldb) prompt before HandlePrivateEvent (from PrivateStateThread) has
+                // a chance to call PushProcessIOHandler().
+                process->SyncIOHandler(0);
+
+                process->GetThreadList().SetSelectedThreadByID(thread->GetID());
+            }
+            else
+            {
+                result.AppendError("Couldn't find thread plan to implement step type.");
+                result.SetStatus(eReturnStatusFailed);
+                return false;
+            }
+
+            // Tag.
+            merge(m_thread_to_path[thread->GetIndexID()], thread, m_step, ++m_thread_to_step[thread->GetIndexID()]);
+
+            // Log.
+            Point point(thread->GetStackFrameAtIndex(0));
+            logFile << "log.append((";
+            logFile << '"' << point.file << "\", ";
+            logFile << "0x" << std::hex << point.address;
+            logFile << "))\n";
+            logFile << std::flush;
+        }
+        logFile.close();
+
+        // Write output.
+        std::ofstream outputFile(outputFileName.c_str());
+        if (outputFile)
+        {
+            outputFile << "threads=[]\n";
+            for (auto i : m_thread_to_path)
+            {
+                outputFile << "threads.append(\n";
+                print(outputFile, i.second, m_start, 1);
+                outputFile << ")\n";
+            }
+            outputFile.close();
+        }
+        else
+        {
+            result.AppendErrorWithFormat("couldn't open output file\n");
+            result.SetStatus(eReturnStatusFailed);
+            return false;
+        }
+
+        // Success.
+        result.SetStatus(eReturnStatusSuccessFinishNoResult);
+        return true;
+    }
+
+    struct Point
+    {
+        static Point
+        invalid()
+        {
+            return Point("????", addr_t(-1));
+        }
+
+        Point(StackFrameSP stackFrame)
+        {
+            const Address &a = stackFrame->GetFrameCodeAddress();
+            if (a.GetModule())
+                file = a.GetModule()->GetSpecificationDescription();
+            else
+                file = "????";
+            address = a.GetFileAddress();
+        }
+
+        Point(std::string file, addr_t address) :
+            file(file),
+            address(address)
+        {
+        }
+
+        bool operator<(const Point &other) const
+        {
+            if (file < other.file)
+                return true;
+            if (address < other.address)
+                return true;
+            return false;
+        }
+
+        std::string file;
+        addr_t address;
+    };
+
+    struct Info;
+    typedef std::map<Point, Info> Path;
+
+    typedef std::chrono::time_point<std::chrono::steady_clock> Time;
+
+    struct Step
+    {
+        Step(uint64_t global, uint64_t local) :
+            t(std::chrono::steady_clock::now()),
+            global(global),
+            local(local)
+        {
+        }
+
+        std::string
+        toString(Time start)
+        {
+            std::stringstream ss;
+            ss << "{ 't': ";
+            ss << std::chrono::duration_cast<std::chrono::nanoseconds>(t - start).count();
+            ss << ", 'g': ";
+            ss << global;
+            ss << ", 'l': ";
+            ss << local;
+            ss << "}";
+            return ss.str();
+        }
+
+        Time t;
+        uint64_t global, local;
+    };
+
+    struct Info
+    {
+        std::vector<Step> steps;
+        Path children;
+    };
+
+    struct UInt64
+    {
+        UInt64() :
+            v(0)
+        {
+        }
+
+        UInt64(uint64_t v) :
+            v(v)
+        {
+        }
+
+        operator uint64_t()
+        {
+            return v;
+        }
+
+        UInt64 operator++()
+        {
+            return ++v;
+        }
+        
+        uint64_t v;
+    };
+
+    void
+    merge(Path &path, ThreadSP thread, uint64_t global_step, uint64_t local_step, uint32_t depth = 1)
+    {
+        uint32_t frames = thread->GetStackFrameCount();
+        if (frames == 0)
+        {
+            Info info;
+            info.steps.push_back(Step(global_step, local_step));
+            path[Point::invalid()] = info;
+        }
+        Point point(thread->GetStackFrameAtIndex(frames - depth));
+        Info &info = path[point];
+        if (depth == frames)
+            info.steps.push_back(Step(global_step, local_step));
+        else
+            merge(info.children, thread, global_step, local_step, depth + 1);
+    }
+
+    void
+    indent(std::ostream &output, uint32_t indentation)
+    {
+        for (uint32_t i = 0; i < indentation; ++i)
+            output << '\t';
+    }
+
+    void
+    print(std::ostream &output, const Path &path, Time start, uint32_t indentation)
+    {
+        // Multiline?
+        bool multiline = false;
+        if (path.size() > 1)
+            multiline = true;
+        else
+            for (auto i : path)
+                if (i.second.children.size() || i.second.steps.size() > 1)
+                {
+                    multiline = true;
+                    break;
+                }
+        // Start paths.
+        indent(output, indentation);
+        if (multiline)
+            output << "[\n";
+        else
+            output << "[";
+        // Individual paths.
+        for (auto i : path)
+        {
+            // Indent?
+            if (multiline)
+                indent(output, indentation);
+            // Start tuple.
+            output << "(";
+            // File.
+            output << '"' << i.first.file << "\", ";
+            // Address.
+            output << "0x" << std::hex << i.first.address << ", ";
+            // Start steps.
+            bool steps_multiline = i.second.steps.size() > 1;
+            output << "[";
+            if (steps_multiline)
+                output << "\n";
+            // Individual steps.
+            for (auto j : i.second.steps)
+            {
+                if (steps_multiline)
+                    indent(output, indentation + 1);
+                output << j.toString(start) << ", ";
+                if (steps_multiline)
+                    output << "\n";
+            }
+            // End steps.
+            if (steps_multiline)
+                indent(output, indentation);
+            output << "], ";
+            // Children.
+            if (i.second.children.size())
+            {
+                output << "\n";
+                print(output, i.second.children, start, indentation + 1);
+            }
+            else
+                output << "[]";
+            // End tuple.
+            if (i.second.children.size())
+                indent(output, indentation);
+            output << "),";
+            if (multiline)
+                output << "\n";
+        }
+        // End paths.
+        if (multiline)
+            indent(output, indentation);
+        output << "]\n";
+    }
+
+    std::map<uint32_t, Path> m_thread_to_path;
+    uint64_t m_step;
+    std::map<uint32_t, UInt64> m_thread_to_step;
+    Time m_start;
+};
+
+//-------------------------------------------------------------------------
 // CommandObjectMultiwordThread
 //-------------------------------------------------------------------------
 
@@ -2276,6 +2673,7 @@ CommandObjectMultiwordThread::CommandObjectMultiwordThread (CommandInterpreter &
                                                     eStepScopeSource)));
 
     LoadSubCommand ("plan", CommandObjectSP (new CommandObjectMultiwordThreadPlan(interpreter)));
+    LoadSubCommand ("tag", CommandObjectSP (new CommandObjectThreadTag(interpreter)));
 }
 
 CommandObjectMultiwordThread::~CommandObjectMultiwordThread ()
